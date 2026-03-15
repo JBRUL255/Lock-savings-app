@@ -1,74 +1,35 @@
-// ================== IMPORTS ==================
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import axios from "axios";
-import crypto from "crypto";
-import { createClient } from "@supabase/supabase-js";
-import path from "path";
-import { fileURLToPath } from "url";
 
-// ================== CONFIG ==================
 dotenv.config();
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors());
+app.use(express.static("public"));
 
-// Needed for Paystack webhook (raw body)
-app.use(
-  "/api/paystack/webhook",
-  express.raw({ type: "application/json" })
-);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PORT = process.env.PORT || 10000;
+const paymentsFile = path.join(__dirname, "payments.json");
 
-// ================== ENV VALIDATION ==================
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  PAYSTACK_SECRET_KEY,
-  PAYSTACK_PUBLIC_KEY,
-  FRONTEND_URL,
-} = process.env;
-
-if (
-  !SUPABASE_URL ||
-  !SUPABASE_SERVICE_ROLE_KEY ||
-  !PAYSTACK_SECRET_KEY
-) {
-  throw new Error("❌ Missing required environment variables");
-}
-
-// ================== SUPABASE ==================
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY
-);
-
-// ================== PAYSTACK INIT ==================
-app.post("/api/paystack/init", async (req, res) => {
+// Initialize payment
+app.post("/api/paystack", async (req, res) => {
   try {
     const { phone, amount } = req.body;
-
     if (!phone || !amount) {
-      return res.status(400).json({
-        error: "Phone number and amount required",
-      });
+      return res.status(400).json({ error: "Phone number and amount are required" });
     }
 
-    // Paystack REQUIRES email
-    const email = `user${phone}@walletapp.com`;
+    const email = `user${phone}@apexnetworks.com`;
 
     const response = await axios.post(
       "https://api.paystack.co/transaction/initialize",
       {
         email,
-        amount: amount * 100, // ksh → cents
-        currency: "KES",
-        channels: ["mobile_money"],
+        amount: amount * 100,
+        callback_url: "https://apexnetworks.onrender.com/api/verify-payment",
         metadata: { phone },
-        callback_url: `${FRONTEND_URL}/payment-success`,
       },
       {
         headers: {
@@ -78,100 +39,56 @@ app.post("/api/paystack/init", async (req, res) => {
       }
     );
 
-    res.json({
-      authorization_url:
-        response.data.data.authorization_url,
-    });
-  } catch (err) {
-    console.error(
-      "Paystack init error:",
-      err.response?.data || err.message
-    );
-    res.status(500).json({
-      error: "Failed to initialize payment",
-    });
+    res.json({ authorization_url: response.data.data.authorization_url });
+  } catch (error) {
+    console.error("Paystack init error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Payment initialization failed" });
   }
 });
 
-// ================== PAYSTACK WEBHOOK ==================
-app.post("/api/paystack/webhook", async (req, res) => {
+// Verify payment
+app.get("/api/verify-payment", async (req, res) => {
+  const { reference } = req.query;
+  if (!reference) return res.status(400).send("Missing transaction reference");
+
   try {
-    const hash = crypto
-      .createHmac("sha512", PAYSTACK_SECRET_KEY)
-      .update(req.body)
-      .digest("hex");
+    const verifyRes = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
+    });
 
-    if (hash !== req.headers["x-paystack-signature"]) {
-      return res.sendStatus(401);
-    }
+    const data = verifyRes.data.data;
+    const record = {
+      phone: data.metadata.phone,
+      amount: data.amount / 100,
+      reference: data.reference,
+      status: data.status,
+      date: new Date().toISOString(),
+    };
 
-    const event = JSON.parse(req.body.toString());
+    let payments = [];
+    if (fs.existsSync(paymentsFile)) payments = JSON.parse(fs.readFileSync(paymentsFile));
+    payments.push(record);
+    fs.writeFileSync(paymentsFile, JSON.stringify(payments, null, 2));
 
-    if (event.event === "charge.success") {
-      const data = event.data;
-      const phone = data.metadata.phone;
-      const amount = data.amount / 100;
-
-      // Update wallet balance
-      await supabase.rpc("increment_wallet", {
-        phone_number: phone,
-        deposit_amount: amount,
-      });
-
-      // Save transaction
-      await supabase.from("transactions").insert({
-        phone,
-        amount,
-        reference: data.reference,
-        status: "success",
-        type: "deposit",
-      });
-    }
-
-    res.sendStatus(200);
+    res.send(`
+      <html>
+        <body style="font-family:Poppins; text-align:center; background:#f8f9fb; margin-top:10%;">
+          <div style="background:#fff; padding:40px; border-radius:10px; display:inline-block; box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+            <h2 style="color:#00c853;">✅ Payment Verified!</h2>
+            <p>Phone: ${data.metadata.phone}</p>
+            <p>Amount: Ksh ${(data.amount / 100).toFixed(2)}</p>
+            <p>Status: ${data.status}</p>
+            <a href="/" style="text-decoration:none; color:#2a5298;">Return to Homepage</a>
+          </div>
+        </body>
+      </html>
+    `);
   } catch (err) {
-    console.error("Webhook error:", err.message);
-    res.sendStatus(500);
+    console.error("Verification error:", err.response?.data || err.message);
+    res.status(500).send("Payment verification failed");
   }
 });
 
-// ================== GET WALLET ==================
-app.get("/api/wallet/:phone", async (req, res) => {
-  const { phone } = req.params;
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
-  const { data, error } = await supabase
-    .from("wallets")
-    .select("balance")
-    .eq("phone", phone)
-    .single();
-
-  if (error) {
-    return res.status(400).json({ error: error.message });
-  }
-
-  res.json({ balance: data.balance });
-});
-
-// ================== ADMIN TRANSACTIONS ==================
-app.get("/api/admin/transactions", async (req, res) => {
-  const { data, error } = await supabase
-    .from("transactions")
-    .select("*")
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
-
-  res.json(data);
-});
-
-// ================== ROOT ==================
-app.get("/", (req, res) => {
-  res.send("✅ Wallet API running");
-});
-
-// ================== START ==================
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Apex Networks server running on port ${PORT}`));
